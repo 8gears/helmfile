@@ -1,9 +1,12 @@
 package app
 
 import (
+	"fmt"
 	"github.com/roboll/helmfile/pkg/argparser"
 	"github.com/roboll/helmfile/pkg/helmexec"
 	"github.com/roboll/helmfile/pkg/state"
+	"sort"
+	"strings"
 )
 
 type Run struct {
@@ -61,21 +64,21 @@ func (r *Run) Status(c StatusesConfigProvider) []error {
 	return r.state.ReleaseStatuses(r.helm, workers)
 }
 
-func (r *Run) Diff(c DiffConfigProvider) []error {
+func (r *Run) Diff(c DiffConfigProvider) (*string, bool, []error) {
 	st := r.state
 	helm := r.helm
 	ctx := r.ctx
 
 	if !c.SkipDeps() {
 		if errs := ctx.SyncReposOnce(st, helm); errs != nil && len(errs) > 0 {
-			return errs
+			return nil, false, errs
 		}
 		if errs := st.BuildDeps(helm); errs != nil && len(errs) > 0 {
-			return errs
+			return nil, false, errs
 		}
 	}
 	if errs := st.PrepareReleases(helm, "diff"); errs != nil && len(errs) > 0 {
-		return errs
+		return nil, false, errs
 	}
 
 	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
@@ -85,9 +88,12 @@ func (r *Run) Diff(c DiffConfigProvider) []error {
 		NoColor: c.NoColor(),
 		Set:     c.Set(),
 	}
-	_, errs := st.DiffReleases(helm, c.Values(), c.Concurrency(), c.DetailedExitcode(), c.IncludeTests(), c.SuppressSecrets(), c.SuppressDiff(), true, opts)
 
-	return errs
+	//_, errs := st.DiffReleases(helm, c.Values(), c.Concurrency(), c.DetailedExitcode(), c.IncludeTests(), c.SuppressSecrets(), c.SuppressDiff(), true, opts)
+
+	infoMsg, _, deleted, errs := r.diff(true, c.DetailedExitcode(), c, opts)
+
+	return infoMsg, len(deleted) > 0, errs
 }
 
 func (r *Run) Test(c TestConfigProvider) []error {
@@ -123,4 +129,84 @@ func (r *Run) Lint(c LintConfigProvider) []error {
 		Set: c.Set(),
 	}
 	return st.LintReleases(helm, values, args, workers, opts)
+}
+
+func (run *Run) diff(triggerCleanupEvent bool, detailedExitCode bool, c DiffConfigProvider, diffOpts *state.DiffOpts) (*string, map[string]state.ReleaseSpec, map[string]state.ReleaseSpec, []error) {
+	st := run.state
+	helm := run.helm
+
+	var changedReleases []state.ReleaseSpec
+	var deletingReleases []state.ReleaseSpec
+	var planningErrs []error
+
+	// TODO Better way to detect diff on only filtered releases
+	{
+		changedReleases, planningErrs = st.DiffReleases(helm, c.Values(), c.Concurrency(), detailedExitCode, c.IncludeTests(), c.SuppressSecrets(), c.SuppressDiff(), triggerCleanupEvent, diffOpts)
+
+		var err error
+		deletingReleases, err = st.DetectReleasesToBeDeletedForSync(helm, st.Releases)
+		if err != nil {
+			planningErrs = append(planningErrs, err)
+		}
+	}
+
+	fatalErrs := []error{}
+
+	for _, e := range planningErrs {
+		switch err := e.(type) {
+		case *state.ReleaseError:
+			if err.Code != 2 {
+				fatalErrs = append(fatalErrs, e)
+			}
+		default:
+			fatalErrs = append(fatalErrs, e)
+		}
+	}
+
+	if len(fatalErrs) > 0 {
+		return nil, nil, nil, fatalErrs
+	}
+
+	releasesToBeDeleted := map[string]state.ReleaseSpec{}
+	for _, r := range deletingReleases {
+		id := state.ReleaseToID(&r)
+		releasesToBeDeleted[id] = r
+	}
+
+	releasesToBeUpdated := map[string]state.ReleaseSpec{}
+	for _, r := range changedReleases {
+		id := state.ReleaseToID(&r)
+
+		// If `helm-diff` detected changes but it is not being `helm delete`ed, we should run `helm upgrade`
+		if _, ok := releasesToBeDeleted[id]; !ok {
+			releasesToBeUpdated[id] = r
+		}
+	}
+
+	// sync only when there are changes
+	if len(releasesToBeUpdated) == 0 && len(releasesToBeDeleted) == 0 {
+		var msg *string
+		if c.DetailedExitcode() {
+			// TODO better way to get the logger
+			m := "No affected releases"
+			msg = &m
+		}
+		return msg, nil, nil, nil
+	}
+
+	names := []string{}
+	for _, r := range releasesToBeUpdated {
+		names = append(names, fmt.Sprintf("  %s (%s) UPDATED", r.Name, r.Chart))
+	}
+	for _, r := range releasesToBeDeleted {
+		names = append(names, fmt.Sprintf("  %s (%s) DELETED", r.Name, r.Chart))
+	}
+	// Make the output deterministic for testing purpose
+	sort.Strings(names)
+
+	infoMsg := fmt.Sprintf(`Affected releases are:
+%s
+`, strings.Join(names, "\n"))
+
+	return &infoMsg, releasesToBeUpdated, releasesToBeDeleted, nil
 }
